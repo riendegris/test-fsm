@@ -21,6 +21,11 @@ enum State {
         details: String,
     },
     Indexed,
+    ValidationInProgress,
+    ValidationError {
+        details: String,
+    },
+    Available,
     Failure(String),
 }
 
@@ -32,6 +37,9 @@ enum Event {
     Index,
     IndexingError(String),
     IndexingComplete,
+    Validate,
+    ValidationError(String),
+    ValidationComplete,
     Reset,
 }
 
@@ -69,6 +77,12 @@ impl State {
             }
             (State::IndexingError { details }, Event::Reset) => State::NotAvailable,
             (State::IndexingInProgress, Event::IndexingComplete) => State::Indexed,
+            (State::Indexed, Event::Validate) => State::ValidationInProgress,
+            (State::ValidationInProgress, Event::ValidationError(d)) => {
+                State::ValidationError { details: d }
+            }
+            (State::ValidationError { details }, Event::Reset) => State::NotAvailable,
+            (State::ValidationInProgress, Event::ValidationComplete) => State::Available,
             (s, e) => State::Failure(
                 format!("Wrong state, event combination: {:#?} {:#?}", s, e).to_string(),
             ),
@@ -110,6 +124,19 @@ impl State {
             }
             State::Indexed => {
                 println!("Indexed");
+                events.push_back(Event::Validate);
+            }
+            State::ValidationInProgress => {
+                println!("Validating");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                println!("Validation complete");
+                events.push_back(Event::ValidationComplete);
+            }
+            State::ValidationError { details } => {
+                println!("Validation Error: {}", details);
+            }
+            State::Available => {
+                println!("Available");
             }
             State::Failure(_) => {}
         }
@@ -128,10 +155,10 @@ fn main() {
     ));
 
     while let Some(event) = events.pop_front() {
-        println!("Received event: {:?}", event);
-        println!("Current state: {:?}", state);
+        // println!("Received event: {:?}", event);
+        // println!("Current state: {:?}", state);
         state = state.next(event);
-        println!("New state: {:?}", state);
+        // println!("New state: {:?}", state);
         if let State::Failure(string) = state {
             println!("{}", string);
             break;
