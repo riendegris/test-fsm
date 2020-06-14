@@ -1,6 +1,5 @@
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
-use tokio::time::{delay_for, Duration, Instant};
+use std::collections::VecDeque;
+use std::time::Instant;
 
 // From https://gist.github.com/anonymous/ee3e4df093c136ced7b394dc7ffb78e1
 
@@ -13,16 +12,26 @@ enum State {
         region: String,
         started_at: Instant,
     },
-    DownloadingError,
+    DownloadingError {
+        details: String,
+    },
     Downloaded,
+    IndexingInProgress,
+    IndexingError {
+        details: String,
+    },
+    Indexed,
     Failure(String),
 }
 
 #[derive(Debug, Clone)]
 enum Event {
     Download(String, String, String),
-    DownloadingError,
+    DownloadingError(String),
     DownloadingComplete,
+    Index,
+    IndexingError(String),
+    IndexingComplete,
     Reset,
 }
 
@@ -42,8 +51,8 @@ impl State {
                     region,
                     started_at,
                 },
-                Event::DownloadingError,
-            ) => State::DownloadingError,
+                Event::DownloadingError(d),
+            ) => State::DownloadingError { details: d },
             (
                 State::DownloadingInProgress {
                     index_type,
@@ -53,23 +62,24 @@ impl State {
                 },
                 Event::DownloadingComplete,
             ) => State::Downloaded,
-            (State::DownloadingError, Event::Reset) => State::NotAvailable,
+            (State::DownloadingError { details }, Event::Reset) => State::NotAvailable,
+            (State::Downloaded, Event::Index) => State::IndexingInProgress,
+            (State::IndexingInProgress, Event::IndexingError(d)) => {
+                State::IndexingError { details: d }
+            }
+            (State::IndexingError { details }, Event::Reset) => State::NotAvailable,
+            (State::IndexingInProgress, Event::IndexingComplete) => State::Indexed,
             (s, e) => State::Failure(
                 format!("Wrong state, event combination: {:#?} {:#?}", s, e).to_string(),
             ),
         }
     }
 
-    async fn run(&self, mut tx: mpsc::Sender<Event>) {
-        match *self {
+    fn run(&self, events: &mut VecDeque<Event>) {
+        match self {
             State::NotAvailable => {
                 println!("Not Available");
                 println!("Sending Download Event");
-                tx.send(Event::Download(
-                    String::from("admins"),
-                    String::from("cosmogony"),
-                    String::from("france"),
-                ));
             }
             State::DownloadingInProgress {
                 index_type,
@@ -78,55 +88,55 @@ impl State {
                 started_at,
             } => {
                 println!("Downloading from {}", data_source);
-                delay_for(Duration::from_secs(1)).await;
+                std::thread::sleep(std::time::Duration::from_secs(1));
                 println!("Downloading complete");
-                if let Err(err) = tx.send(Event::DownloadingComplete).await {
-                    println!("You should have used try_send!");
-                }
+                events.push_back(Event::DownloadingComplete);
             }
-            State::DownloadingError => {
-                println!("Downloading Error");
+            State::DownloadingError { details } => {
+                println!("Downloading Error: {}", details);
             }
             State::Downloaded => {
                 println!("Downloaded");
+                events.push_back(Event::Index);
+            }
+            State::IndexingInProgress => {
+                println!("Indexing");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                println!("Indexing complete");
+                events.push_back(Event::IndexingComplete);
+            }
+            State::IndexingError { details } => {
+                println!("Indexing Error: {}", details);
+            }
+            State::Indexed => {
+                println!("Indexed");
             }
             State::Failure(_) => {}
         }
     }
 }
 
-async fn execute_fsm(state: Arc<Mutex<State>>, tx: mpsc::Sender<Event>) {
-    // In this function, we check if we're in a failstate.
-    // If we are, we return, which drops the tx, and will stop the rx loop in turn.
-    // If it's not a failstate, we execute the current state.
-    loop {
-        match state.lock().unwrap() {
-            State::Failure(string) => {
-                println!("Failure: {}", string);
-                return;
-            }
-            State::DownloadingError => {
-                println!("Download Error");
-                return;
-            }
-            state => state.run(tx.clone()),
+fn main() {
+    let mut state = State::NotAvailable;
+
+    let mut events = VecDeque::new();
+
+    events.push_back(Event::Download(
+        String::from("admins"),
+        String::from("cosmogony"),
+        String::from("france"),
+    ));
+
+    while let Some(event) = events.pop_front() {
+        println!("Received event: {:?}", event);
+        println!("Current state: {:?}", state);
+        state = state.next(event);
+        println!("New state: {:?}", state);
+        if let State::Failure(string) = state {
+            println!("{}", string);
+            break;
+        } else {
+            state.run(&mut events)
         }
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), tokio::io::Error> {
-    let mut state = Arc::new(Mutex::new(State::NotAvailable));
-
-    let (mut tx, mut rx) = mpsc::channel(10);
-
-    tokio::spawn(async move { execute_fsm(state.clone(), tx.clone()).await });
-
-    while let Some(e) = rx.recv().await {
-        println!("Received event: {:?}", e);
-        println!("Current state: {:?}", state);
-        state = state.lock().unwrap().next(e);
-        println!("New state: {:?}", state);
-    }
-    Ok(())
 }
