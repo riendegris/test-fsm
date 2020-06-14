@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Instant;
 
 // From https://gist.github.com/anonymous/ee3e4df093c136ced7b394dc7ffb78e1
@@ -43,15 +44,30 @@ enum Event {
     Reset,
 }
 
-impl State {
-    fn next(self, event: Event) -> State {
-        match (self, event) {
-            (State::NotAvailable, Event::Download(i, d, r)) => State::DownloadingInProgress {
-                index_type: i,
-                data_source: d,
-                region: r,
-                started_at: Instant::now(),
-            },
+struct Driver {
+    state: State,
+    working_dir: PathBuf,
+    events: VecDeque<Event>,
+}
+
+impl Driver {
+    fn new() -> Self {
+        Driver {
+            state: State::NotAvailable,
+            working_dir: PathBuf::from("./work"),
+            events: VecDeque::new(),
+        }
+    }
+    fn next(&mut self, event: Event) {
+        match (&self.state, event) {
+            (State::NotAvailable, Event::Download(i, d, r)) => {
+                self.state = State::DownloadingInProgress {
+                    index_type: i,
+                    data_source: d,
+                    region: r,
+                    started_at: Instant::now(),
+                };
+            }
             (
                 State::DownloadingInProgress {
                     index_type,
@@ -59,8 +75,12 @@ impl State {
                     region,
                     started_at,
                 },
-                Event::DownloadingError(d),
-            ) => State::DownloadingError { details: d },
+                Event::DownloadingError(ref d),
+            ) => {
+                self.state = State::DownloadingError {
+                    details: String::from(d.as_str()),
+                };
+            }
             (
                 State::DownloadingInProgress {
                     index_type,
@@ -69,28 +89,46 @@ impl State {
                     started_at,
                 },
                 Event::DownloadingComplete,
-            ) => State::Downloaded,
-            (State::DownloadingError { details }, Event::Reset) => State::NotAvailable,
-            (State::Downloaded, Event::Index) => State::IndexingInProgress,
+            ) => {
+                self.state = State::Downloaded;
+            }
+            (State::DownloadingError { details }, Event::Reset) => {
+                self.state = State::NotAvailable;
+            }
+            (State::Downloaded, Event::Index) => {
+                self.state = State::IndexingInProgress;
+            }
             (State::IndexingInProgress, Event::IndexingError(d)) => {
-                State::IndexingError { details: d }
+                self.state = State::IndexingError { details: d }
             }
-            (State::IndexingError { details }, Event::Reset) => State::NotAvailable,
-            (State::IndexingInProgress, Event::IndexingComplete) => State::Indexed,
-            (State::Indexed, Event::Validate) => State::ValidationInProgress,
+            (State::IndexingError { details }, Event::Reset) => {
+                self.state = State::NotAvailable;
+            }
+            (State::IndexingInProgress, Event::IndexingComplete) => {
+                self.state = State::Indexed;
+            }
+            (State::Indexed, Event::Validate) => {
+                self.state = State::ValidationInProgress;
+            }
             (State::ValidationInProgress, Event::ValidationError(d)) => {
-                State::ValidationError { details: d }
+                self.state = State::ValidationError { details: d }
             }
-            (State::ValidationError { details }, Event::Reset) => State::NotAvailable,
-            (State::ValidationInProgress, Event::ValidationComplete) => State::Available,
-            (s, e) => State::Failure(
-                format!("Wrong state, event combination: {:#?} {:#?}", s, e).to_string(),
-            ),
+            (State::ValidationError { details }, Event::Reset) => {
+                self.state = State::NotAvailable;
+            }
+            (State::ValidationInProgress, Event::ValidationComplete) => {
+                self.state = State::Available;
+            }
+            (s, e) => {
+                self.state = State::Failure(
+                    format!("Wrong state, event combination: {:#?} {:#?}", s, e).to_string(),
+                )
+            }
         }
     }
 
-    fn run(&self, events: &mut VecDeque<Event>) {
-        match self {
+    fn run(&mut self) {
+        match &self.state {
             State::NotAvailable => {
                 println!("Not Available");
                 println!("Sending Download Event");
@@ -104,33 +142,34 @@ impl State {
                 println!("Downloading from {}", data_source);
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 println!("Downloading complete");
-                events.push_back(Event::DownloadingComplete);
+                self.events.push_back(Event::DownloadingComplete);
             }
             State::DownloadingError { details } => {
                 println!("Downloading Error: {}", details);
             }
             State::Downloaded => {
                 println!("Downloaded");
-                events.push_back(Event::Index);
+                self.events.push_back(Event::Index);
             }
             State::IndexingInProgress => {
                 println!("Indexing");
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 println!("Indexing complete");
-                events.push_back(Event::IndexingComplete);
+                self.events
+                    .push_back(Event::IndexingError(String::from("Oops")));
             }
             State::IndexingError { details } => {
                 println!("Indexing Error: {}", details);
             }
             State::Indexed => {
                 println!("Indexed");
-                events.push_back(Event::Validate);
+                self.events.push_back(Event::Validate);
             }
             State::ValidationInProgress => {
                 println!("Validating");
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 println!("Validation complete");
-                events.push_back(Event::ValidationComplete);
+                self.events.push_back(Event::ValidationComplete);
             }
             State::ValidationError { details } => {
                 println!("Validation Error: {}", details);
@@ -141,29 +180,25 @@ impl State {
             State::Failure(_) => {}
         }
     }
+    fn drive(&mut self) {
+        self.events.push_back(Event::Download(
+            String::from("admins"),
+            String::from("cosmogony"),
+            String::from("france"),
+        ));
+        while let Some(event) = self.events.pop_front() {
+            self.next(event);
+            if let State::Failure(string) = &self.state {
+                println!("{}", string);
+                break;
+            } else {
+                self.run()
+            }
+        }
+    }
 }
 
 fn main() {
-    let mut state = State::NotAvailable;
-
-    let mut events = VecDeque::new();
-
-    events.push_back(Event::Download(
-        String::from("admins"),
-        String::from("cosmogony"),
-        String::from("france"),
-    ));
-
-    while let Some(event) = events.pop_front() {
-        // println!("Received event: {:?}", event);
-        // println!("Current state: {:?}", state);
-        state = state.next(event);
-        // println!("New state: {:?}", state);
-        if let State::Failure(string) = state {
-            println!("{}", string);
-            break;
-        } else {
-            state.run(&mut events)
-        }
-    }
+    let mut driver = Driver::new();
+    driver.drive();
 }
