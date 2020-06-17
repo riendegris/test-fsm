@@ -236,6 +236,21 @@ impl Driver {
                             )));
                         }
                     },
+                    "ntfs" => {
+                        match ntfs::download_ntfs_region(self.working_dir.clone(), &self.region) {
+                            Ok(file_path) => {
+                                let duration = started_at.elapsed();
+                                self.events
+                                    .push_back(Event::DownloadingComplete(file_path, duration));
+                            }
+                            Err(err) => {
+                                self.events.push_back(Event::DownloadingError(format!(
+                                    "Could not download: {}",
+                                    err
+                                )));
+                            }
+                        }
+                    }
                     _ => {
                         self.events.push_back(Event::DownloadingError(format!(
                             "Dont know how to download {}",
@@ -403,6 +418,24 @@ impl Driver {
                             Err(err) => {
                                 self.events.push_back(Event::IndexingError(format!(
                                     "Could not index cosmogony: {}",
+                                    err
+                                )));
+                            }
+                        }
+                    }
+                    "ntfs" => {
+                        match ntfs::index_ntfs_region(
+                            self.mimirs_dir.clone(),
+                            self.es.clone(),
+                            file_path.clone(),
+                        ) {
+                            Ok(()) => {
+                                let duration = started_at.elapsed();
+                                self.events.push_back(Event::IndexingComplete(duration));
+                            }
+                            Err(err) => {
+                                self.events.push_back(Event::IndexingError(format!(
+                                    "Could not index NTFS: {}",
                                     err
                                 )));
                             }

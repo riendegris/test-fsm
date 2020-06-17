@@ -24,4 +24,11 @@ pub enum Error {
         details: String,
         source: url::ParseError,
     },
+
+    #[snafu(display("Serde JSON Error {}: {}", details, source))]
+    #[snafu(visibility(pub))]
+    SerdeJSONError {
+        details: String,
+        source: serde_json::error::Error,
+    },
 }
