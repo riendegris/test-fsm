@@ -100,7 +100,10 @@ pub fn download_ntfs_region(working_dir: PathBuf, region: &str) -> Result<PathBu
     })?;
     let res = download::download(&url, filepath.clone())?;
     let mut command = Command::new("unzip");
+    // We want to unzip in the director 'filepath'
     command.arg("-d").arg(filepath.clone());
+    // We want to overwrite files without prompting
+    command.arg("-o");
     command.arg(res.0.as_path());
     let output = command.output().context(error::IOError {
         details: format!("Could not unzip {}", filepath.display()),
