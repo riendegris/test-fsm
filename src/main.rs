@@ -1,12 +1,15 @@
-use snafu::ResultExt;
+use clap::{App, Arg};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 use url::Url;
 
+mod bano;
+mod cosmogony;
 mod download;
 mod error;
+mod ntfs;
+mod osm;
 
 // From https://gist.github.com/anonymous/ee3e4df093c136ced7b394dc7ffb78e1
 
@@ -190,7 +193,7 @@ impl Driver {
                 );
                 match self.data_source.as_ref() {
                     "cosmogony" => {
-                        match download_osm_region(self.working_dir.clone(), &self.region) {
+                        match osm::download_osm_region(self.working_dir.clone(), &self.region) {
                             Ok(file_path) => {
                                 let duration = started_at.elapsed();
                                 self.events
@@ -204,20 +207,23 @@ impl Driver {
                             }
                         }
                     }
-                    "bano" => match download_bano_region(self.working_dir.clone(), &self.region) {
-                        Ok(file_path) => {
-                            let duration = started_at.elapsed();
-                            self.events
-                                .push_back(Event::DownloadingComplete(file_path, duration));
+                    "bano" => {
+                        match bano::download_bano_region(self.working_dir.clone(), &self.region) {
+                            Ok(file_path) => {
+                                let duration = started_at.elapsed();
+                                self.events
+                                    .push_back(Event::DownloadingComplete(file_path, duration));
+                            }
+                            Err(err) => {
+                                self.events.push_back(Event::DownloadingError(format!(
+                                    "Could not download: {}",
+                                    err
+                                )));
+                            }
                         }
-                        Err(err) => {
-                            self.events.push_back(Event::DownloadingError(format!(
-                                "Could not download: {}",
-                                err
-                            )));
-                        }
-                    },
-                    "osm" => match download_osm_region(self.working_dir.clone(), &self.region) {
+                    }
+                    "osm" => match osm::download_osm_region(self.working_dir.clone(), &self.region)
+                    {
                         Ok(file_path) => {
                             let duration = started_at.elapsed();
                             self.events
@@ -273,7 +279,7 @@ impl Driver {
                 );
                 match self.data_source.as_ref() {
                     "cosmogony" => {
-                        match generate_cosmogony(
+                        match cosmogony::generate_cosmogony(
                             self.cosmogony_dir.clone(),
                             self.working_dir.clone(),
                             file_path.clone(),
@@ -328,7 +334,7 @@ impl Driver {
                 );
                 match self.data_source.as_ref() {
                     "bano" => {
-                        match index_bano_region(
+                        match bano::index_bano_region(
                             self.mimirs_dir.clone(),
                             self.es.clone(),
                             file_path.clone(),
@@ -345,8 +351,47 @@ impl Driver {
                             }
                         }
                     }
+                    "osm" => {
+                        // We need to analyze the index_type to see how we are going to import
+                        // osm: do we need to import admins, streets, ...?
+                        // FIXME: Here, for simplicity, we hard code index_poi = false
+                        let index = match self.index_type.as_ref() {
+                            "admins" => Some((true, false, false)),
+                            "streets" => Some((false, true, false)),
+                            _ => None,
+                        };
+
+                        if index.is_none() {
+                            self.events.push_back(Event::IndexingError(format!(
+                                "Could not index {} using OSM",
+                                self.index_type
+                            )));
+                        } else {
+                            let index = index.unwrap();
+                            match osm::index_osm_region(
+                                self.mimirs_dir.clone(),
+                                self.es.clone(),
+                                file_path.clone(),
+                                index.0,
+                                index.1,
+                                index.2,
+                                8, // 8 = default city level
+                            ) {
+                                Ok(()) => {
+                                    let duration = started_at.elapsed();
+                                    self.events.push_back(Event::IndexingComplete(duration));
+                                }
+                                Err(err) => {
+                                    self.events.push_back(Event::IndexingError(format!(
+                                        "Could not index OSM: {}",
+                                        err
+                                    )));
+                                }
+                            }
+                        }
+                    }
                     "cosmogony" => {
-                        match index_cosmogony_region(
+                        match cosmogony::index_cosmogony_region(
                             self.mimirs_dir.clone(),
                             self.es.clone(),
                             file_path.clone(),
@@ -412,155 +457,44 @@ impl Driver {
     }
 }
 
-fn download_bano_region(working_dir: PathBuf, region: &str) -> Result<PathBuf, error::Error> {
-    let filename = match region.len() {
-        1 => format!("bano-0{}.csv", region),
-        _ => format!("bano-{}.csv", region),
-    };
-    let target = format!("http://bano.openstreetmap.fr/data/{}", filename);
-    let mut filepath = working_dir;
-    filepath.push("bano");
-    if !filepath.is_dir() {
-        std::fs::create_dir(filepath.as_path()).context(error::IOError {
-            details: format!(
-                "Expected to download in BANO file in {}, which is not a directory",
-                filepath.display()
-            ),
+fn main() -> Result<(), error::Error> {
+    let matches = App::new("Create Elasticsearch Index")
+        .version("0.1")
+        .author("Matthieu Paindavoine")
+        .arg(
+            Arg::with_name("index_type")
+                .short("i")
+                .value_name("STRING")
+                .help("input type (admins, streets, addresses)"),
+        )
+        .arg(
+            Arg::with_name("data_source")
+                .short("d")
+                .value_name("STRING")
+                .help("data source (osm, bano, openaddress)"),
+        )
+        .arg(
+            Arg::with_name("region")
+                .short("r")
+                .value_name("STRING")
+                .help("region"),
+        )
+        .get_matches();
+
+    let index_type = matches
+        .value_of("index_type")
+        .ok_or(error::Error::MiscError {
+            details: String::from("Missing Index Type"),
         })?;
-    }
-    let res = download::download(&target, filepath)?;
-    Ok(res.0)
-}
-
-// Download the pbf associated with a region.
-// This is a very rudimentary function, which:
-// * does not handle correctly regions outside of france
-// * has a hard coded timeout to 300s
-fn download_osm_region(working_dir: PathBuf, region: &str) -> Result<PathBuf, error::Error> {
-    let filename = format!("{}-latest.osm.pbf", region);
-    let target = format!("https://download.geofabrik.de/europe/france/{}", filename);
-    let mut filepath = working_dir;
-    filepath.push("osm");
-    if !filepath.is_dir() {
-        std::fs::create_dir(filepath.as_path()).context(error::IOError {
-            details: format!(
-                "Expected to download in BANO file in {}, which is not a directory",
-                filepath.display()
-            ),
+    let data_source = matches
+        .value_of("data_source")
+        .ok_or(error::Error::MiscError {
+            details: String::from("Missing Data Source"),
         })?;
-    }
-    let res = download::download(&target, filepath)?;
-    Ok(res.0)
-}
-
-fn index_bano_region(mimirs_dir: PathBuf, es: Url, filepath: PathBuf) -> Result<(), error::Error> {
-    let mut execpath = mimirs_dir;
-    execpath.push("target");
-    execpath.push("release");
-    execpath.push("bano2mimir");
-    // FIXME Need test file exists
-    let mut command = Command::new(&execpath);
-    command
-        .arg("--connection-string")
-        .arg(es.as_str())
-        .arg("--input")
-        .arg(filepath.clone());
-    println!("command: {:?}", command);
-    let output = command.output().context(error::IOError {
-        details: format!(
-            "Could not create bano2mimir command using {}",
-            execpath.display()
-        ),
+    let region = matches.value_of("region").ok_or(error::Error::MiscError {
+        details: String::from("Missing Region"),
     })?;
-    if !output.status.success() {
-        Err(error::Error::MiscError {
-            details: format!("=> {}", String::from_utf8(output.stderr).unwrap()),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-fn index_cosmogony_region(
-    mimirs_dir: PathBuf,
-    es: Url,
-    filepath: PathBuf,
-) -> Result<(), error::Error> {
-    let mut execpath = mimirs_dir;
-    execpath.push("target");
-    execpath.push("release");
-    execpath.push("cosmogony2mimir");
-    // FIXME Need test file exists
-    let mut command = Command::new(&execpath);
-    command
-        .arg("--connection-string")
-        .arg(es.as_str())
-        .arg("--input")
-        .arg(filepath.clone());
-    println!("command: {:?}", command);
-    let output = command.output().context(error::IOError {
-        details: format!(
-            "Could not create cosmogony2mimir command using {}",
-            execpath.display()
-        ),
-    })?;
-    if !output.status.success() {
-        Err(error::Error::MiscError {
-            details: format!("=> {}", String::from_utf8(output.stderr).unwrap()),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-fn generate_cosmogony(
-    cosmogony_dir: PathBuf,
-    working_dir: PathBuf,
-    inputpath: PathBuf,
-    region: &str,
-) -> Result<PathBuf, error::Error> {
-    let filename = format!("{}.json.gz", region);
-    let mut outputpath = working_dir;
-    outputpath.push("cosmogony");
-    if !outputpath.is_dir() {
-        std::fs::create_dir(outputpath.as_path()).context(error::IOError {
-            details: format!(
-                "Could not create output directory for cosmogony {}",
-                outputpath.display()
-            ),
-        })?;
-    }
-    outputpath.push(&filename);
-    let mut execpath = cosmogony_dir;
-    execpath.push("target");
-    execpath.push("release");
-    execpath.push("cosmogony");
-    // FIXME Need to test exec exists
-    let mut command = Command::new(&execpath);
-    command
-        .arg("--country-code")
-        .arg("FR")
-        .arg("--input")
-        .arg(inputpath.clone())
-        .arg("--output")
-        .arg(outputpath.clone());
-    println!("command: {:?}", command);
-    let output = command.output().context(error::IOError {
-        details: format!(
-            "Could not create cosmogony command using {}",
-            execpath.display()
-        ),
-    })?;
-    if !output.status.success() {
-        Err(error::Error::MiscError {
-            details: format!("=> {}", String::from_utf8(output.stderr).unwrap()),
-        })
-    } else {
-        Ok(outputpath)
-    }
-}
-
-fn main() {
-    let mut driver = Driver::new("admins", "cosmogony", "basse-normandie");
+    let mut driver = Driver::new(index_type, data_source, region);
     driver.drive();
+    Ok(())
 }
