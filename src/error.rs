@@ -31,4 +31,32 @@ pub enum Error {
         details: String,
         source: serde_json::error::Error,
     },
+
+    #[snafu(display("ZeroMQ Error {}: {}", details, source))]
+    #[snafu(visibility(pub))]
+    ZMQError {
+        details: String,
+        source: async_zmq::Error,
+    },
+
+    #[snafu(display("ZeroMQ Subscribe Error {}: {}", details, source))]
+    #[snafu(visibility(pub))]
+    ZMQSubscribeError {
+        details: String,
+        source: async_zmq::SubscribeError,
+    },
+
+    #[snafu(display("ZeroMQ Socket Error {}: {}", details, source))]
+    #[snafu(visibility(pub))]
+    ZMQSocketError {
+        details: String,
+        source: async_zmq::SocketError,
+    },
+
+    #[snafu(display("ZeroMQ Receive Error {}: {}", details, source))]
+    #[snafu(visibility(pub))]
+    ZMQRecvError {
+        details: String,
+        source: async_zmq::RecvError,
+    },
 }

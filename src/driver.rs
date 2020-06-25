@@ -1,21 +1,25 @@
+use async_zmq::{Message, MultipartIter, SendError, SinkExt};
+use serde::Serialize;
+use snafu::ResultExt;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use std::time::{Duration, SystemTime};
+//use std::time::{Duration, SystemTime};
 use url::Url;
 
 use super::bano;
 use super::cosmogony;
+use super::error;
 use super::ntfs;
 use super::osm;
 
 // From https://gist.github.com/anonymous/ee3e4df093c136ced7b394dc7ffb78e1
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum State {
     NotAvailable,
     DownloadingInProgress {
-        started_at: Instant,
+        started_at: SystemTime,
     },
     DownloadingError {
         details: String,
@@ -26,7 +30,7 @@ pub enum State {
     },
     ProcessingInProgress {
         file_path: PathBuf,
-        started_at: Instant,
+        started_at: SystemTime,
     },
     ProcessingError {
         details: String,
@@ -37,7 +41,7 @@ pub enum State {
     },
     IndexingInProgress {
         file_path: PathBuf,
-        started_at: Instant,
+        started_at: SystemTime,
     },
     IndexingError {
         details: String,
@@ -53,7 +57,7 @@ pub enum State {
     Failure(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 enum Event {
     Download,
     DownloadingError(String),
@@ -70,7 +74,8 @@ enum Event {
     Reset,
 }
 
-pub struct Driver {
+// pub struct Driver<I: Iterator<Item = T> + Unpin, T: Into<Message>> {
+pub struct Driver<'a> {
     state: State,
     working_dir: PathBuf,
     mimirs_dir: PathBuf,
@@ -80,17 +85,31 @@ pub struct Driver {
     index_type: String,
     data_source: String,
     region: String,
-    tx: mpsc::Sender<State>,
+    // publish: async_zmq::publish::Publish<std::vec::IntoIter<&'a String>, &'a String>,
+    publish: async_zmq::publish::Publish<std::vec::IntoIter<&'a str>, &'a str>,
 }
 
-impl Driver {
+// impl<I, T> Driver<I, T>
+// where
+//     I: Iterator<Item = T> + Unpin,
+//     T: Into<Message>,
+impl<'a> Driver<'a> {
     pub fn new<S: Into<String>>(
         index_type: S,
         data_source: S,
         region: S,
-        tx: mpsc::Sender<State>,
-    ) -> Self {
-        Driver {
+        port: u32,
+    ) -> Result<Self, error::Error> {
+        let zmq_endpoint = format!("tcp://127.0.0.1:{}", port);
+        let mut zmq = async_zmq::publish(&zmq_endpoint)
+            .context(error::ZMQSocketError {
+                details: format!("Could not publish on endpoint '{}'", zmq_endpoint),
+            })?
+            .bind()
+            .context(error::ZMQError {
+                details: String::from("Could not bind socket for publication"),
+            })?;
+        Ok(Driver {
             state: State::NotAvailable,
             working_dir: PathBuf::from("./work"),
             mimirs_dir: PathBuf::from("/home/matt/lab/rust/kisio/mimirsbrunn"),
@@ -100,14 +119,14 @@ impl Driver {
             index_type: index_type.into(),
             data_source: data_source.into(),
             region: region.into(),
-            tx,
-        }
+            publish: zmq,
+        })
     }
     async fn next(&mut self, event: Event) {
         match (&self.state, event) {
             (State::NotAvailable, Event::Download) => {
                 self.state = State::DownloadingInProgress {
-                    started_at: Instant::now(),
+                    started_at: SystemTime::now(),
                 };
             }
             (State::DownloadingInProgress { .. }, Event::DownloadingError(ref d)) => {
@@ -127,7 +146,7 @@ impl Driver {
             (State::Downloaded { .. }, Event::Process(ref p)) => {
                 self.state = State::ProcessingInProgress {
                     file_path: p.clone(),
-                    started_at: Instant::now(),
+                    started_at: SystemTime::now(),
                 };
             }
             (State::ProcessingInProgress { .. }, Event::ProcessingError(d)) => {
@@ -145,13 +164,13 @@ impl Driver {
             (State::Processed { .. }, Event::Index(ref p)) => {
                 self.state = State::IndexingInProgress {
                     file_path: p.clone(),
-                    started_at: Instant::now(),
+                    started_at: SystemTime::now(),
                 };
             }
             (State::Downloaded { .. }, Event::Index(ref p)) => {
                 self.state = State::IndexingInProgress {
                     file_path: p.clone(),
-                    started_at: Instant::now(),
+                    started_at: SystemTime::now(),
                 };
             }
             (State::IndexingInProgress { .. }, Event::IndexingError(d)) => {
@@ -183,7 +202,6 @@ impl Driver {
                 )
             }
         }
-        self.tx.send(self.state.clone()).await.unwrap();
     }
 
     pub async fn run(&mut self) {
@@ -201,7 +219,7 @@ impl Driver {
                     "cosmogony" => {
                         match osm::download_osm_region(self.working_dir.clone(), &self.region) {
                             Ok(file_path) => {
-                                let duration = started_at.elapsed();
+                                let duration = started_at.elapsed().unwrap();
                                 self.events
                                     .push_back(Event::DownloadingComplete(file_path, duration));
                             }
@@ -216,7 +234,7 @@ impl Driver {
                     "bano" => {
                         match bano::download_bano_region(self.working_dir.clone(), &self.region) {
                             Ok(file_path) => {
-                                let duration = started_at.elapsed();
+                                let duration = started_at.elapsed().unwrap();
                                 self.events
                                     .push_back(Event::DownloadingComplete(file_path, duration));
                             }
@@ -231,7 +249,7 @@ impl Driver {
                     "osm" => match osm::download_osm_region(self.working_dir.clone(), &self.region)
                     {
                         Ok(file_path) => {
-                            let duration = started_at.elapsed();
+                            let duration = started_at.elapsed().unwrap();
                             self.events
                                 .push_back(Event::DownloadingComplete(file_path, duration));
                         }
@@ -245,7 +263,7 @@ impl Driver {
                     "ntfs" => {
                         match ntfs::download_ntfs_region(self.working_dir.clone(), &self.region) {
                             Ok(file_path) => {
-                                let duration = started_at.elapsed();
+                                let duration = started_at.elapsed().unwrap();
                                 self.events
                                     .push_back(Event::DownloadingComplete(file_path, duration));
                             }
@@ -307,7 +325,7 @@ impl Driver {
                             &self.region,
                         ) {
                             Ok(path) => {
-                                let duration = started_at.elapsed();
+                                let duration = started_at.elapsed().unwrap();
                                 self.events
                                     .push_back(Event::ProcessingComplete(path, duration));
                             }
@@ -361,7 +379,7 @@ impl Driver {
                             file_path.clone(),
                         ) {
                             Ok(()) => {
-                                let duration = started_at.elapsed();
+                                let duration = started_at.elapsed().unwrap();
                                 self.events.push_back(Event::IndexingComplete(duration));
                             }
                             Err(err) => {
@@ -399,7 +417,7 @@ impl Driver {
                                 8, // 8 = default city level
                             ) {
                                 Ok(()) => {
-                                    let duration = started_at.elapsed();
+                                    let duration = started_at.elapsed().unwrap();
                                     self.events.push_back(Event::IndexingComplete(duration));
                                 }
                                 Err(err) => {
@@ -418,7 +436,7 @@ impl Driver {
                             file_path.clone(),
                         ) {
                             Ok(()) => {
-                                let duration = started_at.elapsed();
+                                let duration = started_at.elapsed().unwrap();
                                 self.events.push_back(Event::IndexingComplete(duration));
                             }
                             Err(err) => {
@@ -436,7 +454,7 @@ impl Driver {
                             file_path.clone(),
                         ) {
                             Ok(()) => {
-                                let duration = started_at.elapsed();
+                                let duration = started_at.elapsed().unwrap();
                                 self.events.push_back(Event::IndexingComplete(duration));
                             }
                             Err(err) => {
@@ -459,39 +477,33 @@ impl Driver {
                 // println!("Indexing Error: {}", details);
             }
             State::Indexed { duration } => {
-                // println!(
-                //     "Indexed {} {} in {}s",
-                //     self.data_source,
-                //     self.region,
-                //     duration.as_secs()
-                // );
                 self.events.push_back(Event::Validate);
             }
             State::ValidationInProgress => {
-                // println!("Validating");
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                // println!("Validation complete");
                 self.events.push_back(Event::ValidationComplete);
             }
-            State::ValidationError { details } => {
-                // println!("Validation Error: {}", details);
-            }
-            State::Available => {
-                // println!("Available");
-            }
+            State::ValidationError { details } => {}
+            State::Available => {}
             State::Failure(_) => {}
         }
     }
-    pub async fn drive(&mut self) {
-        self.events.push_back(Event::Download);
-        while let Some(event) = self.events.pop_front() {
-            self.next(event).await;
-            if let State::Failure(string) = &self.state {
-                println!("{}", string);
-                break;
-            } else {
-                self.run().await;
-            }
+}
+
+pub async fn drive<'a>(mut driver: Driver<'a>) {
+    driver.events.push_back(Event::Download);
+    while let Some(event) = driver.events.pop_front() {
+        driver.next(event).await;
+        let j = serde_json::to_string(&driver.state).unwrap();
+        let msg = vec!["foo", j.as_str()];
+        // let msg = vec!["foo"];
+        let res: MultipartIter<_, _> = msg.into();
+        driver.publish.send(res).await.unwrap();
+        if let State::Failure(string) = &driver.state {
+            println!("{}", string);
+            break;
+        } else {
+            driver.run().await;
         }
     }
 }

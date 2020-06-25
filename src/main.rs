@@ -1,9 +1,11 @@
+use async_zmq::StreamExt;
 use clap::{App, Arg};
-use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use url::Url;
+use snafu::ResultExt;
+// use std::collections::VecDeque;
+// use std::path::PathBuf;
+// use std::time::{Duration, Instant};
+// use tokio::sync::mpsc;
+// use url::Url;
 
 mod bano;
 mod cosmogony;
@@ -51,14 +53,31 @@ async fn main() -> Result<(), error::Error> {
     let region = matches.value_of("region").ok_or(error::Error::MiscError {
         details: String::from("Missing Region"),
     })?;
-    let (tx, mut rx) = mpsc::channel(100);
-    let mut driver = driver::Driver::new(index_type, data_source, region, tx);
+    let mut driver = driver::Driver::new(index_type, data_source, region, 5555)?;
+    let mut zmq = async_zmq::subscribe("tcp://127.0.0.1:5555")
+        .context(error::ZMQSocketError {
+            details: String::from("Could not subscribe on tcp://127.0.0.1:5555"),
+        })?
+        .connect()
+        .context(error::ZMQError {
+            details: String::from("Could not connect subscribe"),
+        })?;
+    zmq.set_subscribe("state")
+        .context(error::ZMQSubscribeError {
+            details: format!("Could not subscribe to '{}' topic", "state"),
+        })?;
     tokio::spawn(async move {
         driver.drive().await;
     });
-    while let Some(state) = rx.recv().await {
-        println!("{:?}", state)
-    }
+    while let Some(msg) = zmq.next().await {
+        // Received message is a type of Result<MessageBuf>
+        let msg = msg.context(error::ZMQRecvError {
+            details: String::from("ZMQ Reception Error"),
+        })?;
 
+        msg.iter()
+            .skip(1) // skip the topic
+            .for_each(|m| println!("Received: {}", m.as_str().unwrap()));
+    }
     Ok(())
 }
