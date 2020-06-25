@@ -1,11 +1,6 @@
 use async_zmq::StreamExt;
 use clap::{App, Arg};
 use snafu::ResultExt;
-// use std::collections::VecDeque;
-// use std::path::PathBuf;
-// use std::time::{Duration, Instant};
-// use tokio::sync::mpsc;
-// use url::Url;
 
 mod bano;
 mod cosmogony;
