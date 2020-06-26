@@ -12,6 +12,7 @@ mod osm;
 
 #[tokio::main]
 async fn main() -> Result<(), error::Error> {
+    // Retrieve command line arguments
     let matches = App::new("Create Elasticsearch Index")
         .version("0.1")
         .author("Matthieu Paindavoine")
@@ -48,7 +49,14 @@ async fn main() -> Result<(), error::Error> {
     let region = matches.value_of("region").ok_or(error::Error::MiscError {
         details: String::from("Missing Region"),
     })?;
-    let mut driver = driver::Driver::new(index_type, data_source, region, 5555)?;
+
+    // Now construct and initialize the Finite State Machine (FSM)
+    // state is the name of the topic we're asking the publisher to broadcast message,
+    // 5555 is the port
+    let mut driver =
+        driver::Driver::new(index_type, data_source, region, String::from("state"), 5555)?;
+
+    // Ready a subscription connection to receive notifications from the FSM
     let mut zmq = async_zmq::subscribe("tcp://127.0.0.1:5555")
         .context(error::ZMQSocketError {
             details: String::from("Could not subscribe on tcp://127.0.0.1:5555"),
@@ -61,18 +69,37 @@ async fn main() -> Result<(), error::Error> {
         .context(error::ZMQSubscribeError {
             details: format!("Could not subscribe to '{}' topic", "state"),
         })?;
-    tokio::spawn(async move {
-        driver.drive().await;
-    });
+
+    // Start the FSM
+    let _ = tokio::spawn(async move { driver.drive().await })
+        .await
+        .context(error::TokioJoinError {
+            details: String::from("Could not run FSM to completion"),
+        })?;
+
+    // and listen for notifications
     while let Some(msg) = zmq.next().await {
         // Received message is a type of Result<MessageBuf>
         let msg = msg.context(error::ZMQRecvError {
             details: String::from("ZMQ Reception Error"),
         })?;
 
-        msg.iter()
+        let _ = msg
+            .iter()
             .skip(1) // skip the topic
-            .for_each(|m| println!("Received: {}", m.as_str().unwrap()));
+            .try_for_each(|m| {
+                println!("Received: {}", m.as_str().unwrap());
+                let state =
+                    serde_json::from_str(m.as_str().unwrap()).context(error::SerdeJSONError {
+                        details: String::from("Could not deserialize state"),
+                    })?;
+                match state {
+                    driver::State::NotAvailable => Err(error::Error::MiscError {
+                        details: String::from("Not Available"),
+                    }),
+                    _ => Ok(()),
+                }
+            })?;
     }
     Ok(())
 }

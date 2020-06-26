@@ -1,10 +1,9 @@
 use async_zmq::{Message, MultipartIter, SinkExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
-//use std::time::{Duration, SystemTime};
 use url::Url;
 
 use super::bano;
@@ -15,7 +14,7 @@ use super::osm;
 
 // From https://gist.github.com/anonymous/ee3e4df093c136ced7b394dc7ffb78e1
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub enum State {
     NotAvailable,
     DownloadingInProgress {
@@ -57,7 +56,7 @@ pub enum State {
     Failure(String),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 enum Event {
     Download,
     DownloadingError(String),
@@ -74,17 +73,17 @@ enum Event {
     Reset,
 }
 
-// pub struct Driver<I: Iterator<Item = T> + Unpin, T: Into<Message>> {
 pub struct Driver {
-    state: State,
-    working_dir: PathBuf,
-    mimirs_dir: PathBuf,
-    cosmogony_dir: PathBuf,
-    events: VecDeque<Event>,
-    es: Url,
-    index_type: String,
-    data_source: String,
-    region: String,
+    state: State,            // Current state of the FSM
+    working_dir: PathBuf,    // Where all the files will go (download, processed, ...)
+    mimirs_dir: PathBuf,     // Where we can find executables XXX2mimir
+    cosmogony_dir: PathBuf,  // Where we can find cosmogony
+    events: VecDeque<Event>, // A queue of events
+    es: Url,                 // How we connect to elasticsearch
+    index_type: String,      // eg admin, streets, addresses, ...
+    data_source: String,     // eg OSM, BANO, ...
+    region: String,          // The region we need to index
+    topic: String,           // The topic we need to broadcast.
     publish: async_zmq::publish::Publish<std::vec::IntoIter<Message>, Message>,
 }
 
@@ -93,6 +92,7 @@ impl Driver {
         index_type: S,
         data_source: S,
         region: S,
+        topic: String,
         port: u32,
     ) -> Result<Self, error::Error> {
         let zmq_endpoint = format!("tcp://127.0.0.1:{}", port);
@@ -114,6 +114,7 @@ impl Driver {
             index_type: index_type.into(),
             data_source: data_source.into(),
             region: region.into(),
+            topic,
             publish: zmq,
         })
     }
@@ -279,17 +280,15 @@ impl Driver {
                 }
             }
             State::DownloadingError { details: _ } => {
-                // println!("Downloading Error: {}", details);
+                // We can't stay in downloading error state, we need to go back to not available
+                // to terminate the fsm
+                // It might be the place to do some cleanup
+                self.events.push_back(Event::Reset);
             }
             State::Downloaded {
                 file_path,
                 duration: _,
             } => {
-                // println!(
-                //     "Downloaded {} in {}s",
-                //     file_path.display(),
-                //     duration.as_secs()
-                // );
                 // We're done downloading, now we need an extra processing step for cosmogony
                 match self.data_source.as_ref() {
                     "cosmogony" => {
@@ -303,45 +302,36 @@ impl Driver {
             State::ProcessingInProgress {
                 file_path,
                 started_at,
-            } => {
-                // println!(
-                //     "Processing {} / {} / {} using {}",
-                //     self.index_type,
-                //     self.data_source,
-                //     self.region,
-                //     file_path.display()
-                // );
-                match self.data_source.as_ref() {
-                    "cosmogony" => {
-                        match cosmogony::generate_cosmogony(
-                            self.cosmogony_dir.clone(),
-                            self.working_dir.clone(),
-                            file_path.clone(),
-                            &self.region,
-                        ) {
-                            Ok(path) => {
-                                let duration = started_at.elapsed().unwrap();
-                                self.events
-                                    .push_back(Event::ProcessingComplete(path, duration));
-                            }
-                            Err(err) => {
-                                self.events.push_back(Event::ProcessingError(format!(
-                                    "Could not process: {}",
-                                    err
-                                )));
-                            }
+            } => match self.data_source.as_ref() {
+                "cosmogony" => {
+                    match cosmogony::generate_cosmogony(
+                        self.cosmogony_dir.clone(),
+                        self.working_dir.clone(),
+                        file_path.clone(),
+                        &self.region,
+                    ) {
+                        Ok(path) => {
+                            let duration = started_at.elapsed().unwrap();
+                            self.events
+                                .push_back(Event::ProcessingComplete(path, duration));
+                        }
+                        Err(err) => {
+                            self.events.push_back(Event::ProcessingError(format!(
+                                "Could not process: {}",
+                                err
+                            )));
                         }
                     }
-                    _ => {
-                        self.events.push_back(Event::ProcessingError(format!(
-                            "Dont know how to process {}",
-                            &self.data_source
-                        )));
-                    }
                 }
-            }
+                _ => {
+                    self.events.push_back(Event::ProcessingError(format!(
+                        "Dont know how to process {}",
+                        &self.data_source
+                    )));
+                }
+            },
             State::ProcessingError { details: _ } => {
-                // println!("Processing Error: {}", details);
+                self.events.push_back(Event::Reset);
             }
             State::Processed {
                 file_path,
@@ -469,6 +459,7 @@ impl Driver {
                 }
             }
             State::IndexingError { details: _ } => {
+                self.events.push_back(Event::Reset);
                 // println!("Indexing Error: {}", details);
             }
             State::Indexed { duration: _ } => {
@@ -478,19 +469,20 @@ impl Driver {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 self.events.push_back(Event::ValidationComplete);
             }
-            State::ValidationError { details: _ } => {}
+            State::ValidationError { details: _ } => {
+                self.events.push_back(Event::Reset);
+            }
             State::Available => {}
             State::Failure(_) => {}
         }
     }
 
-    pub async fn drive(&mut self) {
+    pub async fn drive(&mut self) -> Result<(), error::Error> {
         self.events.push_back(Event::Download);
         while let Some(event) = self.events.pop_front() {
             self.next(event).await;
-            let i = String::from("state");
+            let i = self.topic.clone();
             let j = serde_json::to_string(&self.state).unwrap();
-            // println!("Publishing... ({})", j);
             let msg = vec![&i, &j];
             let msg: Vec<Message> = msg.into_iter().map(Message::from).collect();
             let res: MultipartIter<_, _> = msg.into();
@@ -502,5 +494,8 @@ impl Driver {
                 self.run().await;
             }
         }
+        self.publish.close().await.context(error::ZMQSendError {
+            details: format!("Could not close publishing endpoint"),
+        })
     }
 }

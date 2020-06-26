@@ -32,6 +32,13 @@ pub enum Error {
         source: serde_json::error::Error,
     },
 
+    #[snafu(display("Tokio Task Error {}: {}", details, source))]
+    #[snafu(visibility(pub))]
+    TokioJoinError {
+        details: String,
+        source: tokio::task::JoinError,
+    },
+
     #[snafu(display("ZeroMQ Error {}: {}", details, source))]
     #[snafu(visibility(pub))]
     ZMQError {
@@ -58,5 +65,12 @@ pub enum Error {
     ZMQRecvError {
         details: String,
         source: async_zmq::RecvError,
+    },
+
+    #[snafu(display("ZeroMQ Send Error {}: {}", details, source))]
+    #[snafu(visibility(pub))]
+    ZMQSendError {
+        details: String,
+        source: async_zmq::SendError,
     },
 }
