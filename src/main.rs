@@ -84,22 +84,27 @@ async fn main() -> Result<(), error::Error> {
             details: String::from("ZMQ Reception Error"),
         })?;
 
-        let _ = msg
+        let msg = msg
             .iter()
             .skip(1) // skip the topic
-            .try_for_each(|m| {
-                println!("Received: {}", m.as_str().unwrap());
-                let state =
-                    serde_json::from_str(m.as_str().unwrap()).context(error::SerdeJSONError {
-                        details: String::from("Could not deserialize state"),
-                    })?;
-                match state {
-                    driver::State::NotAvailable => Err(error::Error::MiscError {
-                        details: String::from("Not Available"),
-                    }),
-                    _ => Ok(()),
-                }
+            .next()
+            .ok_or(error::Error::MiscError {
+                details: String::from("Just one item in a multipart message. That is plain wrong!"),
             })?;
+        println!("Received: {}", msg.as_str().unwrap());
+        let state = serde_json::from_str(msg.as_str().unwrap()).context(error::SerdeJSONError {
+            details: String::from("Could not deserialize state"),
+        })?;
+
+        match state {
+            driver::State::NotAvailable => {
+                break;
+            }
+            driver::State::Available => {
+                break;
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
