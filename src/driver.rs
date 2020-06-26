@@ -1,4 +1,4 @@
-use async_zmq::{Message, MultipartIter, SendError, SinkExt};
+use async_zmq::{Message, MultipartIter, SinkExt};
 use serde::Serialize;
 use snafu::ResultExt;
 use std::collections::VecDeque;
@@ -75,7 +75,7 @@ enum Event {
 }
 
 // pub struct Driver<I: Iterator<Item = T> + Unpin, T: Into<Message>> {
-pub struct Driver<'a> {
+pub struct Driver {
     state: State,
     working_dir: PathBuf,
     mimirs_dir: PathBuf,
@@ -85,15 +85,10 @@ pub struct Driver<'a> {
     index_type: String,
     data_source: String,
     region: String,
-    // publish: async_zmq::publish::Publish<std::vec::IntoIter<&'a String>, &'a String>,
-    publish: async_zmq::publish::Publish<std::vec::IntoIter<&'a str>, &'a str>,
+    publish: async_zmq::publish::Publish<std::vec::IntoIter<Message>, Message>,
 }
 
-// impl<I, T> Driver<I, T>
-// where
-//     I: Iterator<Item = T> + Unpin,
-//     T: Into<Message>,
-impl<'a> Driver<'a> {
+impl Driver {
     pub fn new<S: Into<String>>(
         index_type: S,
         data_source: S,
@@ -101,7 +96,7 @@ impl<'a> Driver<'a> {
         port: u32,
     ) -> Result<Self, error::Error> {
         let zmq_endpoint = format!("tcp://127.0.0.1:{}", port);
-        let mut zmq = async_zmq::publish(&zmq_endpoint)
+        let zmq = async_zmq::publish(&zmq_endpoint)
             .context(error::ZMQSocketError {
                 details: format!("Could not publish on endpoint '{}'", zmq_endpoint),
             })?
@@ -283,12 +278,12 @@ impl<'a> Driver<'a> {
                     }
                 }
             }
-            State::DownloadingError { details } => {
+            State::DownloadingError { details: _ } => {
                 // println!("Downloading Error: {}", details);
             }
             State::Downloaded {
                 file_path,
-                duration,
+                duration: _,
             } => {
                 // println!(
                 //     "Downloaded {} in {}s",
@@ -345,12 +340,12 @@ impl<'a> Driver<'a> {
                     }
                 }
             }
-            State::ProcessingError { details } => {
+            State::ProcessingError { details: _ } => {
                 // println!("Processing Error: {}", details);
             }
             State::Processed {
                 file_path,
-                duration,
+                duration: _,
             } => {
                 // println!(
                 //     "Processed {} {} in {}s",
@@ -473,37 +468,39 @@ impl<'a> Driver<'a> {
                     }
                 }
             }
-            State::IndexingError { details } => {
+            State::IndexingError { details: _ } => {
                 // println!("Indexing Error: {}", details);
             }
-            State::Indexed { duration } => {
+            State::Indexed { duration: _ } => {
                 self.events.push_back(Event::Validate);
             }
             State::ValidationInProgress => {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 self.events.push_back(Event::ValidationComplete);
             }
-            State::ValidationError { details } => {}
+            State::ValidationError { details: _ } => {}
             State::Available => {}
             State::Failure(_) => {}
         }
     }
-}
 
-pub async fn drive<'a>(mut driver: Driver<'a>) {
-    driver.events.push_back(Event::Download);
-    while let Some(event) = driver.events.pop_front() {
-        driver.next(event).await;
-        let j = serde_json::to_string(&driver.state).unwrap();
-        let msg = vec!["foo", j.as_str()];
-        // let msg = vec!["foo"];
-        let res: MultipartIter<_, _> = msg.into();
-        driver.publish.send(res).await.unwrap();
-        if let State::Failure(string) = &driver.state {
-            println!("{}", string);
-            break;
-        } else {
-            driver.run().await;
+    pub async fn drive(&mut self) {
+        self.events.push_back(Event::Download);
+        while let Some(event) = self.events.pop_front() {
+            self.next(event).await;
+            let i = String::from("state");
+            let j = serde_json::to_string(&self.state).unwrap();
+            // println!("Publishing... ({})", j);
+            let msg = vec![&i, &j];
+            let msg: Vec<Message> = msg.into_iter().map(Message::from).collect();
+            let res: MultipartIter<_, _> = msg.into();
+            self.publish.send(res).await.unwrap();
+            if let State::Failure(string) = &self.state {
+                println!("{}", string);
+                break;
+            } else {
+                self.run().await;
+            }
         }
     }
 }
